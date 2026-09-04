@@ -612,6 +612,26 @@ impl CentroidDecompressor {
         let token_bucket_scores =
             &bucket_scores_flat[bucket_scores_offset..bucket_scores_offset + bucket_score_stride];
 
+        // Pre-compute all residual scores when SIMD batch scoring applies
+        // (int8 enabled, 4-bit codes). The batch kernel scores 16 documents
+        // per tbl/pshufb instruction instead of one scalar lookup each.
+        let batch_i32: Option<Vec<i32>> =
+            if let (Some(lut), Some(_)) = (int8_lut, int8_scales) {
+                if self.nbits == 4 {
+                    let off = token_idx * bucket_score_stride;
+                    Some(crate::search::int8_simd::score_batch_4bit(
+                        &local_residuals_raw,
+                        capacity,
+                        residual_bytes_per_embedding,
+                        &lut[off..off + bucket_score_stride],
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
         // Score all embeddings in this cell
         let mut scored: Vec<(i64, f32)> = Vec::with_capacity(capacity);
         for i in 0..capacity {
@@ -621,19 +641,20 @@ impl CentroidDecompressor {
                     continue;
                 }
             }
-            let residual_start = i * residual_bytes_per_embedding;
-            let residual_end = residual_start + residual_bytes_per_embedding;
-            let residual_bytes = &local_residuals_raw[residual_start..residual_end];
 
-            let residual_score =
+            let residual_score = if let Some(ref batch) = batch_i32 {
+                batch[i] as f32 * int8_scales.unwrap()[token_idx]
+            } else {
+                let residual_start = i * residual_bytes_per_embedding;
+                let residual_end = residual_start + residual_bytes_per_embedding;
+                let residual_bytes =
+                    &local_residuals_raw[residual_start..residual_end];
+
                 if let (Some(lut), Some(scales)) = (int8_lut, int8_scales) {
                     let off = token_idx * bucket_score_stride;
                     let token_lut = &lut[off..off + bucket_score_stride];
-                    let raw_sum = if self.nbits == 2 {
-                        Self::score_residual_2bit_int8(residual_bytes, token_lut)
-                    } else {
-                        Self::score_residual_4bit_int8(residual_bytes, token_lut)
-                    };
+                    let raw_sum =
+                        Self::score_residual_2bit_int8(residual_bytes, token_lut);
                     raw_sum as f32 * scales[token_idx]
                 } else if self.nbits == 2 {
                     Self::decompress_residual_2bit(
@@ -649,7 +670,8 @@ impl CentroidDecompressor {
                         token_bucket_scores,
                         bucket_dim_shift,
                     )
-                };
+                }
+            };
 
             scored.push((pid, centroid_score + residual_score));
         }
