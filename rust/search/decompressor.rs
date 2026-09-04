@@ -232,6 +232,22 @@ impl CentroidDecompressor {
         let packed_vals_per_byte = 8usize / self.nbits as usize;
         let residual_bytes_per_embedding = self.dim / packed_vals_per_byte;
 
+        // Validate the on-disk residual row width against the metadata dim
+        // before scoring anything. `decompress_cuda` already does this; the
+        // CPU path did not, so an index whose residuals.npy disagrees with
+        // metadata.json (built at a different dim, or truncated) reached the
+        // scoring loop and produced wrong scores rather than an error.
+        // Checking here, once per call, keeps the per-cell scorers free of
+        // shape concerns.
+        let packed_dim = shard.residuals_compacted.size()[1];
+        anyhow::ensure!(
+            packed_dim as usize * packed_vals_per_byte == self.dim,
+            "Residual shape mismatch: packed_dim={} implies dim={}, but index dim={}",
+            packed_dim,
+            packed_dim as usize * packed_vals_per_byte,
+            self.dim
+        );
+
         let use_int8 = std::env::var("XTR_WARP_INT8").map_or(false, |v| v == "1");
         let (int8_lut, int8_scales) = if use_int8 {
             let (w, s) = Self::build_int8_lut(

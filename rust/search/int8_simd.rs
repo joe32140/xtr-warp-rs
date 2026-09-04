@@ -37,13 +37,18 @@ pub fn score_batch_4bit(
     bytes_per_emb: usize,
     lut: &[i8],
 ) -> Vec<i32> {
-    // These bounds are load-bearing for the `get_unchecked` reads in the
-    // SIMD kernels, so they must be real checks -- `debug_assert!` compiles
-    // out under `[profile.release]`, which is exactly what ships. A short
-    // residual buffer is reachable in practice: `process_cell_impl` builds
-    // it with `.try_into().unwrap_or_default()`, which yields an *empty*
-    // Vec if the tensor conversion fails, and nothing validates the npy
-    // row width against `dim / packed_vals_per_byte` at load time.
+    // Memory-safety backstop for the `get_unchecked` reads below. These must
+    // be real checks, not `debug_assert!`, which compiles out under
+    // `[profile.release]` -- the builds that ship.
+    //
+    // This is defense in depth, NOT the primary validation: a residual row
+    // width that disagrees with the index dim is rejected with an error by
+    // `decompress_centroids_for_shard` before any scoring happens. Returning
+    // zeros here would rank documents by centroid score alone, which looks
+    // plausible and is wrong, so callers must not rely on this path to
+    // report bad data. It exists only so that a buffer that is somehow still
+    // short (e.g. `process_cell_impl`'s `.unwrap_or_default()` yielding an
+    // empty Vec) cannot read out of bounds.
     if residuals.len() < capacity * bytes_per_emb || lut.len() < bytes_per_emb * 2 * 16 {
         return vec![0i32; capacity];
     }
