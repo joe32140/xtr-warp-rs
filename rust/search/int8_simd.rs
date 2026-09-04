@@ -16,6 +16,14 @@
 
 const BATCH: usize = 16;
 
+/// Largest `dim` the i16 accumulators can hold without overflow.
+///
+/// Each lane sums `dim` looked-up values, each in `[-127, 127]`, so the
+/// worst case is `dim * 127`. That must fit i16: `32767 / 127 = 258`.
+/// Above this the kernel would wrap silently (and inconsistently, since
+/// the scalar tail accumulates in i32), so we fall back to scalar.
+const MAX_SIMD_DIM: usize = 258;
+
 /// Score `capacity` residuals against a single query token's int8 LUT.
 ///
 /// Returns one i32 partial score per document (multiply by the token's
@@ -29,8 +37,21 @@ pub fn score_batch_4bit(
     bytes_per_emb: usize,
     lut: &[i8],
 ) -> Vec<i32> {
-    debug_assert!(residuals.len() >= capacity * bytes_per_emb);
-    debug_assert!(lut.len() >= bytes_per_emb * 2 * 16);
+    // These bounds are load-bearing for the `get_unchecked` reads in the
+    // SIMD kernels, so they must be real checks -- `debug_assert!` compiles
+    // out under `[profile.release]`, which is exactly what ships. A short
+    // residual buffer is reachable in practice: `process_cell_impl` builds
+    // it with `.try_into().unwrap_or_default()`, which yields an *empty*
+    // Vec if the tensor conversion fails, and nothing validates the npy
+    // row width against `dim / packed_vals_per_byte` at load time.
+    if residuals.len() < capacity * bytes_per_emb || lut.len() < bytes_per_emb * 2 * 16 {
+        return vec![0i32; capacity];
+    }
+
+    // i16 accumulators cannot represent dim > MAX_SIMD_DIM (see const).
+    if bytes_per_emb * 2 > MAX_SIMD_DIM {
+        return scalar_fallback(residuals, capacity, bytes_per_emb, lut);
+    }
 
     #[cfg(target_arch = "aarch64")]
     {
@@ -241,5 +262,88 @@ mod x86 {
         _mm_storeu_si128(out.as_mut_ptr().add(4) as *mut __m128i, _mm_cvtepi16_epi32(_mm_srli_si128(acc_lo, 8)));
         _mm_storeu_si128(out.as_mut_ptr().add(8) as *mut __m128i, _mm_cvtepi16_epi32(acc_hi));
         _mm_storeu_si128(out.as_mut_ptr().add(12)as *mut __m128i, _mm_cvtepi16_epi32(_mm_srli_si128(acc_hi, 8)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic pseudo-random bytes, no rand dependency in tests.
+    fn residual_bytes(n: usize) -> Vec<u8> {
+        (0..n).map(|i| ((i * 37 + 13) & 0xFF) as u8).collect()
+    }
+
+    fn lut_for(dim: usize) -> Vec<i8> {
+        (0..dim * 16)
+            .map(|i| (((i * 31 + 7) % 255) as i32 - 127) as i8)
+            .collect()
+    }
+
+    /// The SIMD kernel must agree with the scalar reference exactly, for
+    /// capacities on both sides of the 16-doc batch boundary. The standalone
+    /// benchmark only ever used n=8192 (divisible by 16), so the tail path
+    /// was previously untested.
+    #[test]
+    fn simd_matches_scalar_including_tail() {
+        let dim = 128;
+        let bpe = dim / 2;
+        let lut = lut_for(dim);
+
+        for &cap in &[0usize, 1, 3, 15, 16, 17, 31, 32, 33, 100, 1000] {
+            let res = residual_bytes(cap * bpe);
+            let got = score_batch_4bit(&res, cap, bpe, &lut);
+            let want = scalar_fallback(&res, cap, bpe, &lut);
+            assert_eq!(got, want, "mismatch at capacity {cap}");
+        }
+    }
+
+    /// dim > MAX_SIMD_DIM would overflow the i16 accumulators. The guard
+    /// must route to scalar so results stay correct (and, critically, so the
+    /// SIMD body and the scalar tail don't disagree within one cell).
+    #[test]
+    fn large_dim_falls_back_to_scalar_without_overflow() {
+        let dim = 384; // > MAX_SIMD_DIM (258)
+        let bpe = dim / 2;
+        let cap = 20; // spans one full 16-batch plus a 4-doc tail
+        // All-max LUT maximizes the accumulator: 384 * 127 = 48_768 > i16::MAX.
+        let lut = vec![127i8; dim * 16];
+        let res = residual_bytes(cap * bpe);
+
+        let got = score_batch_4bit(&res, cap, bpe, &lut);
+        let want = scalar_fallback(&res, cap, bpe, &lut);
+        assert_eq!(got, want);
+        // Every doc sums dim entries of +127; nothing may wrap negative.
+        for (i, &s) in got.iter().enumerate() {
+            assert_eq!(s, (dim as i32) * 127, "doc {i} wrapped: {s}");
+        }
+    }
+
+    /// A residual buffer shorter than capacity * bytes_per_emb must not be
+    /// read out of bounds. This is reachable in release builds because
+    /// `process_cell_impl` uses `.unwrap_or_default()`, which can hand us an
+    /// empty Vec while capacity > 0.
+    #[test]
+    fn short_or_empty_residuals_do_not_read_out_of_bounds() {
+        let dim = 128;
+        let bpe = dim / 2;
+        let lut = lut_for(dim);
+
+        // Empty buffer, non-zero capacity (the unwrap_or_default case).
+        assert_eq!(score_batch_4bit(&[], 32, bpe, &lut), vec![0i32; 32]);
+
+        // Buffer truncated mid-way: still must not over-read.
+        let res = residual_bytes(20 * bpe);
+        assert_eq!(score_batch_4bit(&res, 40, bpe, &lut), vec![0i32; 40]);
+    }
+
+    /// A LUT shorter than dim*16 must be rejected rather than over-read.
+    #[test]
+    fn short_lut_is_rejected() {
+        let dim = 128;
+        let bpe = dim / 2;
+        let short = vec![0i8; dim * 16 - 1];
+        let res = residual_bytes(16 * bpe);
+        assert_eq!(score_batch_4bit(&res, 16, bpe, &short), vec![0i32; 16]);
     }
 }

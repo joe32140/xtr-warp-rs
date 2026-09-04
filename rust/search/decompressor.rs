@@ -653,8 +653,17 @@ impl CentroidDecompressor {
                 if let (Some(lut), Some(scales)) = (int8_lut, int8_scales) {
                     let off = token_idx * bucket_score_stride;
                     let token_lut = &lut[off..off + bucket_score_stride];
-                    let raw_sum =
-                        Self::score_residual_2bit_int8(residual_bytes, token_lut);
+                    // Route on nbits explicitly. Today this branch is only
+                    // reachable with nbits == 2 (4-bit is handled by the batch
+                    // above), but calling the 2-bit scorer on 4-bit data reads
+                    // the wrong LUT entries *without* going out of bounds, so
+                    // it would silently return garbage rather than panic if
+                    // the batch path ever gains a guard.
+                    let raw_sum = if self.nbits == 4 {
+                        Self::score_residual_4bit_int8(residual_bytes, token_lut)
+                    } else {
+                        Self::score_residual_2bit_int8(residual_bytes, token_lut)
+                    };
                     raw_sum as f32 * scales[token_idx]
                 } else if self.nbits == 2 {
                     Self::decompress_residual_2bit(
@@ -803,7 +812,7 @@ mod tests {
         let stride = dim * num_buckets;
 
         let bucket_scores: Vec<f32> = (0..num_tokens * stride)
-            .map(|i| ((i as f32 * 0.7123).sin() * 0.5))
+            .map(|i| (i as f32 * 0.7123).sin() * 0.5)
             .collect();
 
         let reversed_bit_map = CentroidDecompressor::build_reversed_bit_map(4);
@@ -838,7 +847,7 @@ mod tests {
         let stride = dim * num_buckets;
 
         let bucket_scores: Vec<f32> = (0..num_tokens * stride)
-            .map(|i| ((i as f32 * 0.3917).cos() * 0.4))
+            .map(|i| (i as f32 * 0.3917).cos() * 0.4)
             .collect();
 
         let reversed_bit_map = CentroidDecompressor::build_reversed_bit_map(2);
