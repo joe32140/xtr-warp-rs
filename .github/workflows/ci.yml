@@ -39,4 +39,5 @@ jobs:
         run: |
           uv pip install "torch==2.9.0" pytest pytest-cov maturin numpy setuptools
           uv pip install --no-build-isolation -e .
+          cargo test --release
           pytest tests/test.py tests/test_index_management.py tests/test_filtering.py
