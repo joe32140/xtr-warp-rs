@@ -248,7 +248,7 @@ impl CentroidDecompressor {
             self.dim
         );
 
-        let use_int8 = std::env::var("XTR_WARP_INT8").map_or(false, |v| v == "1");
+        let use_int8 = std::env::var("XTR_WARP_INT8").map_or(true, |v| v != "0");
         let (int8_lut, int8_scales) = if use_int8 {
             let (w, s) = Self::build_int8_lut(
                 &bucket_scores_flat,
